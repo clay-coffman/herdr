@@ -159,17 +159,35 @@ async fn public_pane_move_focus_handles_source_removal_and_unchanged_server_targ
         assert!(moved.changed);
         assert_eq!(server.default_shell_target(), target_before);
         assert_eq!(moved.closed_workspace_id.is_some(), new_workspace);
-        for client_id in [9, 10] {
+        // Public focus follows the invoking window only: the foreground client
+        // (10, connected last) lands on the moved pane; the other keeps its view.
+        assert_eq!(server.foreground_client_id, Some(10));
+        assert_eq!(
+            server.shell_tab_id_for_client(10).as_deref(),
+            Some(moved.pane.tab_id.as_str())
+        );
+        let target = server.shell_focus_target(10).unwrap();
+        assert_eq!(target.pane_id, source);
+        if new_workspace {
+            let location = server.clients[&10].shell_location.as_ref().unwrap();
+            assert_eq!(location.active_tab_ids.len(), 1);
+            // The source tab was removed with the move, so the other client's
+            // location is reconciled onto what remains.
             assert_eq!(
-                server.shell_tab_id_for_client(client_id).as_deref(),
+                server.shell_tab_id_for_client(9).as_deref(),
                 Some(moved.pane.tab_id.as_str())
             );
-            let target = server.shell_focus_target(client_id).unwrap();
-            assert_eq!(target.pane_id, source);
-            if new_workspace {
-                let location = server.clients[&client_id].shell_location.as_ref().unwrap();
-                assert_eq!(location.active_tab_ids.len(), 1);
-            }
+        } else {
+            // Its tab emptied and closed with the move, so the other client is
+            // reconciled onto the first workspace's remaining tab rather than
+            // being dragged into the destination workspace.
+            let remaining_tab = server.app.public_tab_id(0, 0).unwrap();
+            assert_ne!(remaining_tab, first_tab);
+            assert_ne!(remaining_tab, moved.pane.tab_id);
+            assert_eq!(
+                server.shell_tab_id_for_client(9).as_deref(),
+                Some(remaining_tab.as_str())
+            );
         }
         shutdown_test_runtimes(&mut server);
     }

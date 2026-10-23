@@ -2600,7 +2600,7 @@ async fn public_background_tab_create_preserves_client_locations() {
 }
 
 #[tokio::test]
-async fn public_workspace_focus_preserves_each_clients_remembered_tabs() {
+async fn public_workspace_focus_moves_only_the_foreground_client() {
     let mut server = test_headless_server();
     let mut first = crate::workspace::Workspace::test_new("first");
     let second_tab = first.test_add_tab(Some("second"));
@@ -2620,39 +2620,179 @@ async fn public_workspace_focus_preserves_each_clients_remembered_tabs() {
     let _ = first_control.recv().expect("first snapshot");
     let _ = second_control.recv().expect("second snapshot");
     assert!(server.focus_shell_client_on_tab(41, &second_tab_id));
+    // The user last interacted with the second window.
+    assert_eq!(server.foreground_client_id, Some(42));
+    assert_eq!(server.public_focus_client_ids(), vec![42]);
 
-    let (respond_to, _response_rx) = std::sync::mpsc::channel();
-    server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
-        request: crate::api::schema::Request {
-            id: "focus-second-workspace".into(),
-            method: crate::api::schema::Method::WorkspaceFocus(
-                crate::api::schema::WorkspaceTarget {
-                    workspace_id: second_workspace_id.clone(),
-                },
-            ),
-        },
-        respond_to,
-        response_write_complete: None,
-    });
+    public_workspace_focus(&mut server, &second_workspace_id);
 
     let first_location = server.clients[&41].shell_location.as_ref().unwrap();
     let second_location = server.clients[&42].shell_location.as_ref().unwrap();
+    // The other window keeps the view it had, including its remembered tab.
     assert_eq!(
         first_location.focused_workspace_id.as_deref(),
-        Some(second_workspace_id.as_str())
-    );
-    assert_eq!(
-        second_location.focused_workspace_id.as_deref(),
-        Some(second_workspace_id.as_str())
+        Some(first_workspace_id.as_str())
     );
     assert_eq!(
         first_location.active_tab_ids[&first_workspace_id],
         second_tab_id
     );
     assert_eq!(
+        second_location.focused_workspace_id.as_deref(),
+        Some(second_workspace_id.as_str())
+    );
+    assert_eq!(
         second_location.active_tab_ids[&first_workspace_id],
         first_tab_id
     );
+    shutdown_test_runtimes(&mut server);
+}
+
+fn public_workspace_focus(server: &mut HeadlessServer, workspace_id: &str) {
+    let (respond_to, _response_rx) = std::sync::mpsc::channel();
+    server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        request: crate::api::schema::Request {
+            id: "focus-workspace".into(),
+            method: crate::api::schema::Method::WorkspaceFocus(
+                crate::api::schema::WorkspaceTarget {
+                    workspace_id: workspace_id.to_owned(),
+                },
+            ),
+        },
+        respond_to,
+        response_write_complete: None,
+    });
+}
+
+#[tokio::test]
+async fn public_focus_while_a_popup_is_open_moves_the_clients_viewing_its_owner_tab() {
+    let mut server = test_headless_server();
+    let mut first = crate::workspace::Workspace::test_new("first");
+    let second_tab = first.test_add_tab(Some("second"));
+    let second = crate::workspace::Workspace::test_new("second");
+    server.app.state.workspaces = vec![first, second];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let first_workspace_id = server.app.public_workspace_id(0);
+    let second_workspace_id = server.app.public_workspace_id(1);
+    let first_tab_id = server.app.public_tab_id(0, 0).unwrap();
+    let second_tab_id = server.app.public_tab_id(0, second_tab).unwrap();
+
+    let (first_control, _) = connect_test_shell(&mut server, 51, 100, 30);
+    let (second_control, _) = connect_test_shell(&mut server, 52, 80, 24);
+    let (third_control, _) = connect_test_shell(&mut server, 53, 80, 24);
+    let _ = first_control.recv().expect("first snapshot");
+    let _ = second_control.recv().expect("second snapshot");
+    let _ = third_control.recv().expect("third snapshot");
+    // Windows 51 and 53 look at the first tab; window 52 looks at the second
+    // tab and is the foreground client, so the popup rule must win over the
+    // foreground rule for the windows that can actually see the popup.
+    assert!(server.focus_shell_client_on_tab(52, &second_tab_id));
+    server.foreground_client_id = Some(52);
+
+    // A popup command opened from the first tab (for example a picker) calls
+    // the public API to focus the second workspace.
+    let popup_terminal_id = crate::terminal::TerminalId::alloc();
+    server.app.state.terminals.insert(
+        popup_terminal_id.clone(),
+        crate::terminal::TerminalState::new(
+            popup_terminal_id.clone(),
+            std::path::PathBuf::from("/popup"),
+        ),
+    );
+    server.app.state.popup_pane = Some(crate::app::state::PopupPaneState {
+        pane_id: crate::layout::PaneId::alloc(),
+        terminal_id: popup_terminal_id,
+        width: None,
+        height: None,
+    });
+    server.popup_owner_tab_id = Some(first_tab_id.clone());
+    let mut viewers = server.public_focus_client_ids();
+    viewers.sort_unstable();
+    assert_eq!(viewers, vec![51, 53]);
+
+    public_workspace_focus(&mut server, &second_workspace_id);
+
+    for client_id in [51, 53] {
+        let location = server.clients[&client_id].shell_location.as_ref().unwrap();
+        assert_eq!(
+            location.focused_workspace_id.as_deref(),
+            Some(second_workspace_id.as_str()),
+            "popup viewer {client_id} follows the focus"
+        );
+    }
+    let second_location = server.clients[&52].shell_location.as_ref().unwrap();
+    assert_eq!(
+        second_location.focused_workspace_id.as_deref(),
+        Some(first_workspace_id.as_str()),
+        "a window that cannot see the popup keeps its view"
+    );
+    assert_eq!(
+        second_location.active_tab_ids[&first_workspace_id],
+        second_tab_id
+    );
+
+    // When the foreground client is itself one of the popup's viewers, it is
+    // the invoking window and the other viewers keep their view.
+    assert!(server.focus_shell_client_on_tab(51, &first_tab_id));
+    assert!(server.focus_shell_client_on_tab(53, &first_tab_id));
+    server.foreground_client_id = Some(53);
+    assert_eq!(server.public_focus_client_ids(), vec![53]);
+    public_workspace_focus(&mut server, &second_workspace_id);
+    assert_eq!(
+        server.clients[&53]
+            .shell_location
+            .as_ref()
+            .unwrap()
+            .focused_workspace_id
+            .as_deref(),
+        Some(second_workspace_id.as_str())
+    );
+    assert_eq!(
+        server.clients[&51]
+            .shell_location
+            .as_ref()
+            .unwrap()
+            .focused_workspace_id
+            .as_deref(),
+        Some(first_workspace_id.as_str()),
+        "a viewer that is not the foreground client keeps its view"
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn public_focus_without_a_foreground_client_moves_every_client() {
+    let mut server = test_headless_server();
+    let first = crate::workspace::Workspace::test_new("first");
+    let second = crate::workspace::Workspace::test_new("second");
+    server.app.state.workspaces = vec![first, second];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let second_workspace_id = server.app.public_workspace_id(1);
+
+    let (first_control, _) = connect_test_shell(&mut server, 61, 100, 30);
+    let (second_control, _) = connect_test_shell(&mut server, 62, 80, 24);
+    let _ = first_control.recv().expect("first snapshot");
+    let _ = second_control.recv().expect("second snapshot");
+    server.foreground_client_id = None;
+    let mut all = server.public_focus_client_ids();
+    all.sort_unstable();
+    assert_eq!(all, vec![61, 62]);
+
+    public_workspace_focus(&mut server, &second_workspace_id);
+
+    for client_id in [61, 62] {
+        let location = server.clients[&client_id].shell_location.as_ref().unwrap();
+        assert_eq!(
+            location.focused_workspace_id.as_deref(),
+            Some(second_workspace_id.as_str())
+        );
+    }
     shutdown_test_runtimes(&mut server);
 }
 

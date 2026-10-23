@@ -160,7 +160,59 @@ impl HeadlessServer {
         }
     }
 
-    pub(super) fn focus_all_shell_clients_on_default_target(&mut self) {
+    /// Shell clients whose view a successful public focus request moves.
+    ///
+    /// Public socket callers carry no client identity, so the server infers
+    /// the invoking window instead of projecting the focus onto every attached
+    /// client. The foreground client, the one the user interacted with last,
+    /// is the caller when it exists. While a popup is open, only the clients
+    /// viewing the popup's owner tab can see it, so the request is confined to
+    /// them: the foreground client when it is one of them, otherwise all of
+    /// them. Only when no such window exists does the request fall back to
+    /// every shell client, which keeps single-client and headless behaviour
+    /// unchanged.
+    pub(super) fn public_focus_client_ids(&self) -> Vec<u64> {
+        let foreground = self.foreground_client_id.filter(|client_id| {
+            self.clients
+                .get(client_id)
+                .is_some_and(|client| client.is_shell_client())
+        });
+        if self.app.state.popup_pane.is_some() {
+            if let Some(owner_tab_id) = self.popup_owner_tab_id.as_deref() {
+                let viewers = self
+                    .clients
+                    .iter()
+                    .filter(|(_, client)| client.is_shell_client())
+                    .filter(|(&client_id, _)| {
+                        self.shell_tab_id_for_client(client_id).as_deref() == Some(owner_tab_id)
+                    })
+                    .map(|(&client_id, _)| client_id)
+                    .collect::<Vec<_>>();
+                if let Some(client_id) = foreground.filter(|client_id| viewers.contains(client_id))
+                {
+                    return vec![client_id];
+                }
+                if !viewers.is_empty() {
+                    return viewers;
+                }
+            }
+        }
+        if let Some(client_id) = foreground {
+            return vec![client_id];
+        }
+        self.clients
+            .iter()
+            .filter(|(_, client)| client.is_shell_client())
+            .map(|(&client_id, _)| client_id)
+            .collect()
+    }
+
+    pub(super) fn focus_public_shell_clients_on_default_target(&mut self) {
+        let client_ids = self.public_focus_client_ids();
+        self.focus_shell_clients_on_default_target(&client_ids);
+    }
+
+    fn focus_shell_clients_on_default_target(&mut self, client_ids: &[u64]) {
         let Some(target) = self.default_shell_target() else {
             return;
         };
@@ -170,11 +222,13 @@ impl HeadlessServer {
         };
         let focus_before = self.shell_focus_targets();
         let focused_tabs_before = self.focused_shell_tabs();
-        for client in self
-            .clients
-            .values_mut()
-            .filter(|client| client.is_shell_client())
-        {
+        for client_id in client_ids {
+            let Some(client) = self.clients.get_mut(client_id) else {
+                continue;
+            };
+            if !client.is_shell_client() {
+                continue;
+            }
             if let Some(location) = client.shell_location.as_mut() {
                 location.focus_tab(workspace_id.clone(), tab_id.clone());
             }
@@ -183,6 +237,17 @@ impl HeadlessServer {
             self.shell_location_focus_transitions(focus_before, &focused_tabs_before);
         self.app.accept_current_focus_with_api_events();
         self.send_shell_focus_transitions(&lost, &gained);
+    }
+
+    #[cfg(test)]
+    pub(super) fn focus_all_shell_clients_on_default_target(&mut self) {
+        let client_ids = self
+            .clients
+            .iter()
+            .filter(|(_, client)| client.is_shell_client())
+            .map(|(&client_id, _)| client_id)
+            .collect::<Vec<_>>();
+        self.focus_shell_clients_on_default_target(&client_ids);
     }
 
     pub(super) fn focus_shell_client_on_tab(&mut self, client_id: u64, tab_id: &str) -> bool {
@@ -806,7 +871,8 @@ impl HeadlessServer {
         self.apply_shell_tab_geometry_to_target(client_id, target, true)
     }
 
-    /// Applies a public socket request, including its session-wide focus projection.
+    /// Applies a public socket request, projecting a successful focus onto the
+    /// invoking window (see `public_focus_client_ids`).
     pub(super) fn handle_api_request_with_shutdown_check(
         &mut self,
         mut msg: api::ApiRequestMessage,
@@ -893,7 +959,7 @@ impl HeadlessServer {
             || (create_focus_requested && target_changed)
             || pane_move_focus_succeeded;
         if public_focus_succeeded {
-            self.focus_all_shell_clients_on_default_target();
+            self.focus_public_shell_clients_on_default_target();
         }
         if reconcile
             || target_changed

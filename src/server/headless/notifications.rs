@@ -606,7 +606,7 @@ impl HeadlessServer {
                 if shell_navigation_pending {
                     self.app.accept_current_focus_without_events();
                 } else if api_focus_succeeded {
-                    self.focus_all_shell_clients_on_default_target();
+                    self.focus_public_shell_clients_on_default_target();
                 }
                 changed
             }
