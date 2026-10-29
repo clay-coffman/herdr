@@ -55,7 +55,7 @@ pub(super) fn snapshot_with_completions(
             app.public_pane_id(workspace_index, pane_id)
         })
         .or_else(|| snapshot.focused_pane_id.clone());
-    let workspaces = snapshot
+    let workspaces: Vec<protocol::ClientShellWorkspace> = snapshot
         .workspaces
         .into_iter()
         .zip(&app.state.workspaces)
@@ -198,6 +198,11 @@ pub(super) fn snapshot_with_completions(
                 .get(tab_index)
         })
         .is_some_and(|tab| tab.zoomed);
+    let workspace_status = workspaces
+        .iter()
+        .find(|workspace| workspace.focused)
+        .map(|workspace| compact_workspace_label(&workspace.label))
+        .filter(|text| !text.is_empty());
     let tab_bar_right = app
         .state
         .tab_bar_right
@@ -208,6 +213,14 @@ pub(super) fn snapshot_with_completions(
                     text: "ZOOM".to_owned(),
                     accent: true,
                 })
+            }
+            crate::app::state::TabBarStatusSegment::Workspace => {
+                workspace_status
+                    .as_ref()
+                    .map(|text| protocol::ClientShellTabStatusSegment {
+                        text: text.clone(),
+                        accent: true,
+                    })
             }
             crate::app::state::TabBarStatusSegment::Text(Some(text)) if !text.is_empty() => {
                 Some(protocol::ClientShellTabStatusSegment {
@@ -625,9 +638,358 @@ fn split_hit_rect(
     Some(hit)
 }
 
+/// What the client keeps for its tab strip. The client shows the right-hand
+/// status only when `status width + 1 + MIN_TAB_STRIP_WIDTH (17)` fits its tab
+/// bar and otherwise hides all of it (`client/shell/tabs.rs`). Two more columns
+/// cover a client built from a slightly different Herdr.
+const CLIENT_TAB_STRIP_RESERVE: u16 = 17 + 1 + 2;
+const MIN_ACCENT_STATUS_COLUMNS: usize = 4;
+const MAX_WORKSPACE_STATUS_COLUMNS: usize = 60;
+
+/// Fit the tab bar status to one client's width, so the client never hides it
+/// whole. Plain segments (commands, hostname, clock, text) go first, from the
+/// end; the accented ones are this client's own state (its workspace, ZOOM),
+/// and the widest of them is shortened with an ellipsis as a last resort. The
+/// server cannot see whether the client's sidebar is open; when it is, the
+/// sidebar names the workspace anyway.
+pub(super) fn fit_tab_bar_right(snapshot: &mut protocol::ClientShellSnapshot, cols: u16) {
+    use crate::ui::text::display_width;
+    let budget = usize::from(cols.saturating_sub(CLIENT_TAB_STRIP_RESERVE));
+    let separator = display_width(&snapshot.tab_bar_right_separator);
+    let total = |segments: &[&protocol::ClientShellTabStatusSegment]| -> usize {
+        segments
+            .iter()
+            .map(|segment| display_width(&segment.text))
+            .sum::<usize>()
+            + separator * segments.len().saturating_sub(1)
+    };
+    let segments = &mut snapshot.tab_bar_right;
+    if total(&segments.iter().collect::<Vec<_>>()) <= budget {
+        return;
+    }
+    // This client's own segments first, then each plain one, in order, that
+    // still fits: a wide command line gives way to the hostname and clock.
+    let mut keep: Vec<bool> = segments.iter().map(|segment| segment.accent).collect();
+    for index in 0..segments.len() {
+        if keep[index] {
+            continue;
+        }
+        keep[index] = true;
+        let chosen: Vec<_> = segments
+            .iter()
+            .zip(&keep)
+            .filter_map(|(segment, keep)| keep.then_some(segment))
+            .collect();
+        if total(&chosen) > budget {
+            keep[index] = false;
+        }
+    }
+    let mut keep = keep.into_iter();
+    segments.retain(|_| keep.next().unwrap_or(false));
+    loop {
+        let width_now = total(&segments.iter().collect::<Vec<_>>());
+        if width_now <= budget {
+            return;
+        }
+        let Some(widest) =
+            (0..segments.len()).max_by_key(|&index| display_width(&segments[index].text))
+        else {
+            return;
+        };
+        let width = display_width(&segments[widest].text);
+        let room = budget.saturating_sub(width_now - width);
+        if room >= MIN_ACCENT_STATUS_COLUMNS.min(width) {
+            segments[widest].text = shorten(&segments[widest].text, room);
+            return;
+        }
+        if segments.len() > 1 {
+            let keep = segments.remove(widest);
+            segments.clear();
+            segments.push(keep);
+            continue;
+        }
+        segments.clear();
+    }
+}
+
+/// `truncate_end`, without leaving a space or separator before the ellipsis.
+fn shorten(text: &str, max_width: usize) -> String {
+    let short = crate::ui::text::truncate_end(text, max_width);
+    match short.strip_suffix('…') {
+        Some(prefix) if prefix.len() < text.len() => {
+            let prefix = prefix.trim_end_matches([' ', '·', ':', '-', '—', '|', ',']);
+            if prefix.is_empty() {
+                short
+            } else {
+                format!("{prefix}…")
+            }
+        }
+        _ => short,
+    }
+}
+
+/// A workspace label as the tab bar shows it: an issue key first when the
+/// label has one, then the name it belongs to. Tower labels workspaces
+/// `[3] Restricted charts and emergency access · LUM-2291 Restricted-access…`
+/// (catalog number, workstream, issue, title) or `[6] LUM-700 Internal…`; those
+/// become `LUM-2291 · Restricted charts and emergency access` and
+/// `LUM-700 · Internal…`. Any other label is shown as it is.
+fn compact_workspace_label(label: &str) -> String {
+    let body = strip_catalog_number(label.trim());
+    let separators: &[char] = &['·', ':', '-', '—', '|'];
+    let text = match find_issue_key(body) {
+        Some((start, end)) => {
+            let key = &body[start..end];
+            let before = body[..start]
+                .trim_end()
+                .trim_end_matches(separators)
+                .trim_end();
+            let after = body[end..]
+                .trim_start()
+                .trim_start_matches(separators)
+                .trim_start();
+            let name = if before.is_empty() { after } else { before };
+            if name.is_empty() {
+                key.to_owned()
+            } else {
+                format!("{key} · {name}")
+            }
+        }
+        None => body.to_owned(),
+    };
+    shorten(&text, MAX_WORKSPACE_STATUS_COLUMNS)
+}
+
+fn strip_catalog_number(label: &str) -> &str {
+    let Some(rest) = label.strip_prefix('[') else {
+        return label;
+    };
+    let Some((number, rest)) = rest.split_once(']') else {
+        return label;
+    };
+    if number.is_empty() || !number.chars().all(|ch| ch.is_ascii_digit()) {
+        return label;
+    }
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        label
+    } else {
+        rest
+    }
+}
+
+/// Byte range of the first word shaped like an issue key (`LUM-2291`,
+/// `ENG-7`): 2–10 upper-case letters or digits starting with a letter, a
+/// hyphen, and 1–7 digits.
+fn find_issue_key(text: &str) -> Option<(usize, usize)> {
+    let mut start = None;
+    for (index, ch) in text
+        .char_indices()
+        .chain(std::iter::once((text.len(), ' ')))
+    {
+        let word = ch.is_ascii_alphanumeric() || ch == '-';
+        match (start, word) {
+            (None, true) => start = Some(index),
+            (Some(begin), false) => {
+                if is_issue_key(&text[begin..index]) {
+                    return Some((begin, index));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn is_issue_key(word: &str) -> bool {
+    let Some((team, number)) = word.split_once('-') else {
+        return false;
+    };
+    (2..=10).contains(&team.len())
+        && team.starts_with(|ch: char| ch.is_ascii_uppercase())
+        && team
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+        && (1..=7).contains(&number.len())
+        && number.chars().all(|ch| ch.is_ascii_digit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status(text: &str, accent: bool) -> protocol::ClientShellTabStatusSegment {
+        protocol::ClientShellTabStatusSegment {
+            text: text.to_owned(),
+            accent,
+        }
+    }
+
+    #[test]
+    fn workspace_labels_lead_with_the_issue_key() {
+        let cases = [
+            (
+                "[3] Restricted charts and emergency access · LUM-2291 Restricted-access experience redesign and access-enforcement API audit",
+                "LUM-2291 · Restricted charts and emergency access",
+            ),
+            (
+                "[6] LUM-700 Internal operator authentication, accounts and permissions",
+                "LUM-700 · Internal operator authentication, accounts and pe…",
+            ),
+            (
+                "Real text delivery in ehr-dev · LUM-2332 Prove real text delivery in ehr-dev",
+                "LUM-2332 · Real text delivery in ehr-dev",
+            ),
+            ("[1] EHR · Coordinator", "EHR · Coordinator"),
+            ("Tower · Agent coordination", "Tower · Agent coordination"),
+            ("hangar", "hangar"),
+            ("[12]", "[12]"),
+            ("LUM-9", "LUM-9"),
+            ("feat/lum-2291 Restricted-access ehr-dev", "feat/lum-2291 Restricted-access ehr-dev"),
+        ];
+        for (label, expected) in cases {
+            assert_eq!(compact_workspace_label(label), expected, "{label}");
+        }
+        let long = compact_workspace_label(&format!("[2] {} · LUM-606 Order", "x".repeat(90)));
+        assert!(long.starts_with("LUM-606 · xxx"));
+        assert!(long.ends_with('…'));
+        assert_eq!(
+            crate::ui::text::display_width(&long),
+            MAX_WORKSPACE_STATUS_COLUMNS
+        );
+    }
+
+    #[test]
+    fn tab_bar_fits_every_width_and_keeps_the_workspace_longest() {
+        let full = vec![
+            status("LUM-2291 · Restricted charts and emergency access", true),
+            status(
+                "◔1 ✓2 ✓3 ✓4 ✓5 ◔6 ✓7 ⚑8 ✓9 ✓10 ⚑11 ⚑12 ✓13 ◔14 │ ⚑ 3 need you",
+                false,
+            ),
+            status("ip-10-42-7-137", false),
+            status("20:48", false),
+        ];
+        let mut previous_workspace_width = usize::MAX;
+        for cols in (0..=240u16).rev() {
+            let mut snapshot = snapshot_for_tab_bar(full.clone());
+            fit_tab_bar_right(&mut snapshot, cols);
+            let width = client_status_width(&snapshot);
+            // The client's rule: status + 1 + its 17-column tab strip must fit.
+            assert!(
+                width == 0 || width + 1 + 17 <= usize::from(cols),
+                "cols {cols}: status {width} would be hidden"
+            );
+            match snapshot.tab_bar_right.first() {
+                Some(first) => {
+                    assert!(first.accent, "cols {cols}: the workspace goes last");
+                    let workspace = crate::ui::text::display_width(&first.text);
+                    assert!(workspace <= previous_workspace_width);
+                    previous_workspace_width = workspace;
+                }
+                None => assert!(cols < 24, "cols {cols}: nothing shown"),
+            }
+        }
+        let mut wide = snapshot_for_tab_bar(full.clone());
+        fit_tab_bar_right(&mut wide, 240);
+        assert_eq!(wide.tab_bar_right, full);
+        let mut narrow = snapshot_for_tab_bar(full.clone());
+        fit_tab_bar_right(&mut narrow, 60);
+        assert_eq!(
+            narrow.tab_bar_right,
+            vec![status("LUM-2291 · Restricted charts and emerge…", true)]
+        );
+        let mut medium = snapshot_for_tab_bar(full.clone());
+        fit_tab_bar_right(&mut medium, 100);
+        assert_eq!(
+            medium.tab_bar_right,
+            vec![full[0].clone(), full[2].clone(), full[3].clone()],
+            "the rail gives way to the hostname and clock"
+        );
+    }
+
+    /// The client's `tab_bar_status_width` (client/shell/tabs.rs).
+    fn client_status_width(snapshot: &protocol::ClientShellSnapshot) -> usize {
+        let text: usize = snapshot
+            .tab_bar_right
+            .iter()
+            .map(|segment| crate::ui::text::display_width(&segment.text))
+            .sum();
+        text + crate::ui::text::display_width(&snapshot.tab_bar_right_separator)
+            * snapshot.tab_bar_right.len().saturating_sub(1)
+    }
+
+    #[test]
+    fn tab_bar_fit_drops_zoom_before_the_workspace_becomes_unreadable() {
+        let mut snapshot = snapshot_for_tab_bar(vec![
+            status("ZOOM", true),
+            status("LUM-2291 · Restricted charts", true),
+            status("20:48", false),
+        ]);
+        fit_tab_bar_right(&mut snapshot, 30);
+        assert_eq!(snapshot.tab_bar_right, vec![status("LUM-2291…", true)]);
+    }
+
+    fn snapshot_for_tab_bar(
+        segments: Vec<protocol::ClientShellTabStatusSegment>,
+    ) -> protocol::ClientShellSnapshot {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = crate::app::App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let mut snapshot = snapshot(&app, "boot", 1, None, None);
+        snapshot.tab_bar_right = segments;
+        snapshot.tab_bar_right_separator = " │ ".into();
+        snapshot
+    }
+
+    #[test]
+    fn workspace_status_follows_each_clients_own_workspace() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.ui.tab_bar_right = vec![
+            crate::config::TabBarRightEntryConfig::Workspace,
+            crate::config::TabBarRightEntryConfig::Text {
+                text: "shared".into(),
+            },
+        ];
+        let mut app = crate::app::App::new(
+            &config,
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let mut lead = crate::workspace::Workspace::test_new("lead");
+        lead.custom_name =
+            Some("[3] Restricted charts and emergency access · LUM-2291 Restricted-access".into());
+        let mut tool = crate::workspace::Workspace::test_new("tool");
+        tool.custom_name = Some("hangar".into());
+        app.state.workspaces = vec![lead, tool];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+
+        let server_view = snapshot(&app, "boot", 1, None, None);
+        assert_eq!(
+            server_view.tab_bar_right,
+            vec![
+                status("LUM-2291 · Restricted charts and emergency access", true),
+                status("shared", false),
+            ]
+        );
+        let mut location = crate::server::clients::ClientShellLocation::from_snapshot(&server_view);
+        location.focused_workspace_id = Some(server_view.workspaces[1].workspace_id.clone());
+        let other_window = snapshot(&app, "boot", 1, None, Some(&location));
+        assert_eq!(
+            other_window.tab_bar_right,
+            vec![status("hangar", true), status("shared", false)]
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn snapshot_metadata_skips_scroll_reads_and_preserves_public_session_data() {

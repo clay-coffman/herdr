@@ -22,6 +22,9 @@ fn default_command_timeout_seconds() -> u64 {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TabBarRightEntryConfig {
     Zoom,
+    /// The workspace this client is looking at, filled per client. Kept when
+    /// the tab bar is too narrow for everything; plain entries go first.
+    Workspace,
     Hostname,
     Datetime {
         #[serde(default = "default_datetime_format")]
@@ -104,6 +107,7 @@ pub(crate) fn tab_bar_right_diagnostics(entries: &[TabBarRightEntryConfig]) -> V
                 }
             }
             TabBarRightEntryConfig::Zoom
+            | TabBarRightEntryConfig::Workspace
             | TabBarRightEntryConfig::Hostname
             | TabBarRightEntryConfig::Text { .. } => {}
         }

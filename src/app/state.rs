@@ -783,6 +783,8 @@ pub(crate) struct PaneFocusTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TabBarStatusSegment {
     Zoom,
+    /// Filled per client from the workspace that client is looking at.
+    Workspace,
     Text(Option<String>),
 }
 

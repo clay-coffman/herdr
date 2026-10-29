@@ -645,6 +645,10 @@ impl HeadlessServer {
                     self.server_config_diagnostic_without_keybindings.clone()
                 };
                 candidate.revision = client.shell_projection_revision;
+                crate::server::client_shell::fit_tab_bar_right(
+                    &mut candidate,
+                    client.terminal_size.0,
+                );
                 if client.shell_snapshot.as_ref() != Some(&candidate)
                     || client.shell_agent_completions.as_ref() != Some(&completions)
                     || client.shell_agent_view != agent_view

@@ -62,6 +62,11 @@ impl App {
                 TabBarRightEntryConfig::Zoom => {
                     self.state.tab_bar_right.push(TabBarStatusSegment::Zoom);
                 }
+                TabBarRightEntryConfig::Workspace => {
+                    self.state
+                        .tab_bar_right
+                        .push(TabBarStatusSegment::Workspace);
+                }
                 TabBarRightEntryConfig::Hostname => {
                     self.state
                         .tab_bar_right
